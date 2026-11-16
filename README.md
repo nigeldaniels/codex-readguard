@@ -1,6 +1,6 @@
 # Codex Readguard
 
-**Look before you leap.** A project-local hook for Codex that checks for complete
+**Read the fucking code!** A project-local hook for Codex that checks for complete
 reads of the current file and its declared related files before allowing edits.
 It helps prevent speculative changes based on filenames, snippets, or stale code.
 
