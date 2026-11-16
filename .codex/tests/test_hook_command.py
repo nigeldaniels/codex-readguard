@@ -106,6 +106,19 @@ class HookCommandTests(GuardCase):
         result = self.run_hook(self.event("PreToolUse", command="pwd"))
         self.assertEqual(result.returncode, 2)
 
+    def test_native_hook_handles_markdown_and_preserves_heredoc_write_checks(self):
+        for header, code, message in (
+            ("cat > /tmp/readguard-example.md <<'EOF'", 0, ""),
+            ("cat <<'EOF' > source.py", 2, "Read ALL"),
+            ("cat <<'EOF' | tee source.py", 2, "Read ALL"),
+        ):
+            with self.subTest(header=header):
+                command = header + "\n<!-- issue marker -->\nEOF\n"
+                result = self.run_hook(self.event("PreToolUse", command=command))
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertIn(message, result.stderr)
+                self.assertNotIn("IndexError", result.stderr)
+
     def test_matchers_cover_native_edits_and_shell_calls(self):
         pattern = self.config["hooks"]["PreToolUse"][0]["matcher"]
         for name in ("apply_patch", "Bash", "Edit", "Write"):
