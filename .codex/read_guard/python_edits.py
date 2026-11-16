@@ -1,7 +1,6 @@
 """Infer literal Python write targets; dynamic writers need explicit targets."""
 
 import ast
-import re
 from pathlib import Path
 
 from .protocol import DECLARE_WRITES
@@ -17,26 +16,6 @@ def python_targets(source: str) -> list[str]:
         if isinstance(node, ast.Call):
             targets.extend(call_targets(node))
     return targets
-
-
-def extract_heredocs(command: str) -> tuple[str, list[str]]:
-    """Remove heredoc bodies from shell parsing and inspect inline Python bodies.
-
-    Treating script/data lines as shell commands would create false positives.
-    Dynamic Python write paths are intentionally declared, never guessed.
-    """
-    pattern = re.compile(r'''(?m)^(?P<header>[^\n]*?)<<-?\s*(?P<quote>['"]?)(?P<end>\w+)(?P=quote)[^\n]*\n''')
-    pieces, targets, offset = [], [], 0
-    while match := pattern.search(command, offset):
-        end = re.search(r"(?m)^\t*" + re.escape(match["end"]) + r"[ \t]*(?:\n|$)", command[match.end():])
-        if end is None:
-            break
-        body_end = match.end() + end.start()
-        pieces.append(command[offset:match.start()] + match["header"] + "\n")
-        if re.search(r"(?:^|[\s/])python(?:3(?:\.\d+)?)?\s", match["header"]):
-            targets.extend(python_targets(command[match.end():body_end]))
-        offset = match.end() + end.end()
-    return "".join(pieces) + command[offset:], targets
 
 
 def call_targets(call: ast.Call) -> list[str]:

@@ -124,6 +124,15 @@ calls in `-c` scripts and simple heredocs. A command is allowed once its existin
 targets and related files have been fully read and their contexts declared.
 Quoted search text such as `rg '>'` is not treated as a write.
 
+Heredoc bodies are separated from shell syntax before command classification.
+Literal Markdown, HTML comments, and quoted `>` characters in these bodies are
+data. Redirections on either side of `<<` and following pipelines still count
+as writes. Python and shell interpreters reading code from stdin receive their
+normal write analysis, using that command's working directory. Multiple queued
+heredocs and `<<-` tab stripping are supported. Missing operands and unterminated
+heredocs produce explicit diagnostics. Command substitutions in unquoted heredocs
+require the declared-target workflow below; quote the delimiter for literal data.
+
 For opaque scripts, formatters, patch imports, or dynamic write paths, explicitly
 declare every file the command can change:
 
@@ -193,7 +202,8 @@ python3 -m unittest discover -s .codex/tests -t .codex -v
 
 `guard.py` is the entrypoint. `service.py` orchestrates events; `protocol.py`
 defines the CLI/receipt boundary; `files.py` validates and snapshots files;
-`patches.py` extracts patch paths; `shell.py`, `shell_edits.py`, and
+`patches.py` extracts patch paths; `shell_syntax.py` separates command structure
+and heredoc bodies; `shell.py`, `shell_edits.py`, and
 `python_edits.py` recognize CLI edit targets; `state.py` owns transactional
 evidence. Tests run in temporary directories and do not
 touch application files or services.

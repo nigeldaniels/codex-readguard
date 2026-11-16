@@ -1,59 +1,52 @@
 """Recognize guard receipts and common CLI edits without a command allowlist."""
 
 import re
-import shlex
 from pathlib import Path
 
-from .protocol import Request
-from .python_edits import extract_heredocs
-from .shell_edits import command_targets, repository_targets
+from .protocol import DECLARE_WRITES, Request
+from .python_edits import python_targets
+from .shell_edits import command_targets, repository_targets, unwrap_environment
+from .shell_syntax import ShellCommand, ShellParser
 
 
-# Preserve quoting when separating operators: rg '>' must remain a search.
-# This covers ordinary shell words, not every Bash construct. Unknown commands
-# are allowed and earn no read credit; agents must declare opaque CLI edits.
-SHELL_TOKEN = re.compile(
-    r'''(?P<operator>[;&|<>()]+|\n)|(?P<word>(?:[^\s;&|<>()'"\\]+|'[^']*'|"(?:\\.|[^"\\])*"|\\.)+)'''
-)
-SEPARATORS = {";", "&&", "||", "|", "&", "\n"}
+PYTHON = re.compile(r"python(?:3(?:\.\d+)?)?")
+SHELLS = {"sh", "bash", "zsh"}
 
 
 def check_command(root: Path, cwd: Path, command: str, depth: int = 0) -> Request | None:
     if not isinstance(command, str) or not command or len(command) > 131072:
         raise ValueError("Missing or oversized shell command")
-    request = direct_request(root, cwd, command)
-    if request is not None:
-        return request
-    command, script_targets = extract_heredocs(command)
-    targets = repository_targets(root, cwd, script_targets)
-    for words, redirects in command_groups(command):
-        nested_request = direct_request(root, cwd, shlex.join(words)) if words else None
-        if nested_request and nested_request.action == "run":
-            targets.extend(nested_request.writes)
-        if words and Path(words[0]).name in {"sh", "bash", "zsh"} and "-c" in words and depth < 3:
-            index = words.index("-c") + 1
-            nested = check_command(root, cwd, words[index], depth + 1) if index < len(words) else None
-            if nested:
-                targets.extend(nested.writes)
-        names, next_cwd = command_targets(words, cwd)
-        targets.extend(repository_targets(root, cwd, names + redirects))
+    groups = ShellParser(command).parse()
+    if len(groups) == 1:
+        request = direct_request(root, cwd, groups[0])
+        if request and not groups[0].redirects:
+            return request
+    targets = []
+    for group in groups:
+        declared = direct_request(root, cwd, group)
+        if declared and declared.action == "run":
+            targets.extend(declared.writes)
+            names, next_cwd = [], cwd
+        else:
+            targets.extend(script_targets(root, cwd, group, depth))
+            names, next_cwd = command_targets(group.words, cwd)
+        targets.extend(repository_targets(root, cwd, names + group.redirects))
         cwd = next_cwd
     return Request("edit", writes=tuple(sorted(set(targets)))) if targets else None
 
 
-def direct_request(root: Path, cwd: Path, command: str) -> Request | None:
-    groups = list(command_groups(command))
-    if len(groups) != 1 or groups[0][1]:
-        return None
-    arguments = groups[0][0]
-    if len(arguments) < 3 or not re.fullmatch(r"python(?:3(?:\.\d+)?)?", Path(arguments[0]).name):
+def direct_request(root: Path, cwd: Path, group: ShellCommand) -> Request | None:
+    arguments = group.words
+    if len(arguments) < 3 or not PYTHON.fullmatch(Path(arguments[0]).name):
         return None
     script = Path(arguments[1])
     if (script if script.is_absolute() else cwd / script).resolve() != root / ".codex/guard.py":
         return None
-    # Do not credit commands whose arguments the shell would expand differently.
-    for match in SHELL_TOKEN.finditer(command):
-        raw = match.group()
+    # Redirected/piped readers cannot earn credit. The declared-write wrapper
+    # can receive stdin, but its shell redirections still need separate checks.
+    if arguments[2] != "run" and group.has_redirection:
+        return None
+    for raw in group.raw_words:
         if any(char in raw for char in ("$", "`")) and not (raw.startswith("'") and raw.endswith("'")):
             raise ValueError("Use literal guard arguments; declare the actual file paths")
     if arguments[2] not in {"check", "read", "context", "run"}:
@@ -61,25 +54,55 @@ def direct_request(root: Path, cwd: Path, command: str) -> Request | None:
     return Request.parse(arguments[2:])
 
 
-def command_groups(command: str):
-    """Yield literal argv and output paths; fd duplication is not a file write."""
-    words, redirects = [], []
-    tokens = list(SHELL_TOKEN.finditer(command))
-    index = 0
-    while index < len(tokens):
-        match = tokens[index]
-        token = match.group()
-        index += 1
-        if match.lastgroup == "word":
-            words.append(shlex.split(token)[0])
-        elif token in SEPARATORS:
-            if words or redirects:
-                yield words, redirects
-            words, redirects = [], []
-        elif token in {">", ">>", ">|", "&>", "&>>"} and index < len(tokens):
-            redirects.append(shlex.split(tokens[index].group())[0])
-            index += 1
-        elif token in {"<", ">&", "<&"} and index < len(tokens):
-            index += 1
-    if words or redirects:
-        yield words, redirects
+def script_targets(root: Path, cwd: Path, group: ShellCommand, depth: int) -> list[str]:
+    words = unwrap_environment(group.words)
+    if not words:
+        return []
+    program, args = Path(words[0]).name, words[1:]
+    targets = []
+    mode, inline = interpreter_input(program, args)
+    if mode == "inline":
+        targets.extend(nested_targets(root, cwd, inline, depth))
+    for document in group.heredocs:
+        # Unquoted heredocs expand substitutions even for a data consumer such
+        # as cat. Require explicit targets instead of silently discarding code.
+        if document.expands and ("$(" in document.body or "`" in document.body):
+            raise ValueError(DECLARE_WRITES)
+    stdin = [document for document in group.heredocs if document.descriptor == "0"]
+    if not stdin or mode != "stdin":
+        return targets
+    body = stdin[-1].body
+    if PYTHON.fullmatch(program):
+        targets.extend(repository_targets(root, cwd, python_targets(body)))
+    elif program in SHELLS:
+        targets.extend(nested_targets(root, cwd, body, depth))
+    return targets
+
+
+def interpreter_input(program: str, args: list[str]) -> tuple[str, str]:
+    if not PYTHON.fullmatch(program) and program not in SHELLS:
+        return "data", ""
+    options = iter(args)
+    for arg in options:
+        if arg in {"-c", "-m"}:
+            mode = "inline" if program in SHELLS and arg == "-c" else "data"
+            return mode, next(options, "")
+        if arg in {"-W", "-X", "-o", "-O", "--rcfile", "--init-file"}:
+            next(options, None)
+        elif arg == "--":
+            return ("stdin" if next(options, "-") == "-" else "data"), ""
+        elif arg == "-" or (program in SHELLS and arg.startswith("-")
+                            and not arg.startswith("--") and "s" in arg):
+            # Arguments after stdin selection belong to the script, not to the
+            # interpreter. They must not turn executable stdin into plain data.
+            return "stdin", ""
+        elif not arg.startswith("-"):
+            return "data", ""
+    return "stdin", ""
+
+
+def nested_targets(root: Path, cwd: Path, source: str, depth: int) -> tuple[str, ...]:
+    if depth >= 3:
+        raise ValueError(DECLARE_WRITES)
+    request = check_command(root, cwd, source, depth + 1) if source.strip() else None
+    return request.writes if request else ()
